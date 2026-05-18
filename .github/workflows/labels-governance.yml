@@ -1,4 +1,12 @@
-name: Label Taxonomy
+# Labels Governance Workflow
+#
+# This workflow applies a reconciliation-based model to maintain label consistency
+# across repositories.
+#
+# It does NOT apply real-time policy. Instead, it periodically aligns repositories
+# with the defined label taxonomy using introduce, migrate, and reconcile modes.
+
+name: Labels Governance
 
 on:
   schedule:
@@ -14,7 +22,7 @@ on:
         options:
           - introduce
           - migrate
-          - enforce
+          - reconcile
 
       stage:
         description: "Rollout stage (defined in staged-migration.json)"
@@ -32,21 +40,21 @@ on:
         default: true
         type: boolean
 
-      enforce_confirmation:
-        description: "Enforce mode only — leave blank for introduce/migrate. Type ENFORCE to confirm."
+      reconcile_confirmation:
+        description: "Reconcile mode only — leave blank for introduce/migrate. Type RECONCILE to confirm."
         required: false
         default: ""
         type: string
 
 concurrency:
-  group: label-taxonomy-${{ github.repository }}-${{ github.event.inputs.stage || 'all' }}-${{ github.event.inputs.mode || 'enforce' }}
+  group: labels-governance-${{ github.repository }}-${{ github.event.inputs.stage || 'all' }}-${{ github.event.inputs.mode || 'reconcile' }}
   cancel-in-progress: false
 
 env:
-  MODE: ${{ github.event.inputs.mode || 'enforce' }}
+  MODE: ${{ github.event.inputs.mode || 'reconcile' }}
   STAGE: ${{ github.event.inputs.stage || 'all' }}
   DRY_RUN: ${{ github.event.inputs.dry_run != '' && github.event.inputs.dry_run || 'false' }}
-  ENFORCE_CONFIRMATION: ${{ github.event.inputs.enforce_confirmation || '' }}
+  RECONCILE_CONFIRMATION: ${{ github.event.inputs.reconcile_confirmation || '' }}
 
 jobs:
   labels:
@@ -68,18 +76,18 @@ jobs:
           private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           installation_id: ${{ secrets.GH_INSTALLATION_ID }}
 
-      - name: Enforce mode confirmation guard
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'enforce' }}
+      - name: Reconcile mode confirmation guard
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'reconcile' }}
         shell: bash
         run: |
-          if [ "${ENFORCE_CONFIRMATION}" != "ENFORCE" ]; then
-            echo "enforce mode requires enforce_confirmation=ENFORCE"
+          if [ "${RECONCILE_CONFIRMATION}" != "RECONCILE" ]; then
+            echo "reconcile mode requires reconcile_confirmation=RECONCILE"
             exit 1
           fi
 
       # ✅ Main execution
-      - name: Run Label Taxonomy
-        id: run-taxonomy
+      - name: Run Labels Governance
+        id: run-governance
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
@@ -157,7 +165,7 @@ jobs:
             const mapping = JSON.parse(fs.readFileSync('./labels/config/label-mapping.json', 'utf8'));
             const staging = JSON.parse(fs.readFileSync('./labels/config/staged-migration.json', 'utf8'));
 
-            const taxonomyNames = new Set(labels.map(l => l.name));
+            const governanceLabelNames = new Set(labels.map(l => l.name));
 
             // ✅ Validation (important!)
             if (!Array.isArray(labels)) {
@@ -176,11 +184,11 @@ jobs:
               throw new Error(`Stage "${STAGE}" must be an array of repos`);
             }
 
-            if (!taxonomyNames.has(DEFAULT_PRIORITY_LABEL)) {
+            if (!governanceLabelNames.has(DEFAULT_PRIORITY_LABEL)) {
               throw new Error(`Required default priority label "${DEFAULT_PRIORITY_LABEL}" missing from labels.json`);
             }
 
-            if (!taxonomyNames.has(DEFAULT_TYPE_LABEL)) {
+            if (!governanceLabelNames.has(DEFAULT_TYPE_LABEL)) {
               throw new Error(`Required default type label "${DEFAULT_TYPE_LABEL}" missing from labels.json`);
             }
 
@@ -311,13 +319,13 @@ jobs:
 
                   const simulatedLabels = [...new Set([...currentLabels, ...labelsToAdd])];
 
-                  if (MODE === "enforce" && !issueHasAny(simulatedLabels, PRIORITY_LABELS)) {
+                  if (MODE === "reconcile" && !issueHasAny(simulatedLabels, PRIORITY_LABELS)) {
                     labelsToAdd.add(DEFAULT_PRIORITY_LABEL);
                     repoAudit.defaultPriorityApplied += 1;
                     totals.defaultPriorityApplied += 1;
                   }
 
-                  if (MODE === "enforce" && !issueHasAny(simulatedLabels, TYPE_LABELS)) {
+                  if (MODE === "reconcile" && !issueHasAny(simulatedLabels, TYPE_LABELS)) {
                     labelsToAdd.add(DEFAULT_TYPE_LABEL);
                     repoAudit.defaultTypeApplied += 1;
                     totals.defaultTypeApplied += 1;
@@ -364,16 +372,16 @@ jobs:
               }
 
               // ============================
-              // ✅ STEP 3 — Enforce Cleanup
+              // ✅ STEP 3 — Reconcile Cleanup
               // ============================
-              if (MODE === "enforce") {
+              if (MODE === "reconcile") {
 
-                console.log(`🧹 Cleaning up non-taxonomy labels`);
+                console.log(`🧹 Cleaning up non-governed labels`);
 
                 for (const label of existing) {
-                  if (!taxonomyNames.has(label.name)) {
+                  if (!governanceLabelNames.has(label.name)) {
                     const applied = await maybeApply(
-                      `Delete non-taxonomy label ${label.name} in ${repoFull}`,
+                      `Delete non-governed label ${label.name} in ${repoFull}`,
                       async () => {
                         await github.rest.issues.deleteLabel({
                           owner,
@@ -401,7 +409,7 @@ jobs:
             fs.writeFileSync('labels-governance-audit.json', JSON.stringify(audit, null, 2));
 
             const summaryLines = [
-              '## Label Taxonomy Audit',
+              '## Labels Governance Audit',
               '',
               `- Mode: ${MODE}`,
               `- Stage: ${STAGE}`,

@@ -1,14 +1,14 @@
-# Label Taxonomy Platform (DevEx)
+# Labels Governance Platform (DevEx)
 
-This repository provides a centralised platform to standardise and enforce GitHub labels across all repositories accessible to a GitHub App installation.
+This repository provides a centralised platform to standardise and reconcile GitHub labels across all repositories accessible to a GitHub App installation.
 
 ---
 
 ## Purpose
 
-- Standardise label taxonomy across all repositories
-- Safely migrate legacy labels to the taxonomy
-- Enforce consistency with optional scheduled runs
+- Standardise governed labels across all repositories
+- Safely migrate legacy labels to the governance labels
+- Prevent drift with optional scheduled reconciliation runs
 - Guarantee every issue and open PR has at minimum one type and one priority label
 
 ---
@@ -18,9 +18,9 @@ This repository provides a centralised platform to standardise and enforce GitHu
 | File | Purpose |
 |---|---|
 | `labels/config/labels.json` | Source of truth — all desired labels with name, color, and description |
-| `labels/config/label-mapping.json` | Maps legacy label names to their taxonomy equivalents |
+| `labels/config/label-mapping.json` | Maps legacy label names to their governance label equivalents |
 | `labels/config/staged-migration.json` | Defines `stage1` and `stage2` explicit repo lists for controlled rollout |
-| `.github/workflows/labels-governance.yml` | Main workflow — introduce, migrate, enforce |
+| `.github/workflows/labels-governance.yml` | Main workflow — introduce, migrate, and reconcile |
 
 ---
 
@@ -44,16 +44,17 @@ This repository provides a centralised platform to standardise and enforce GitHu
 
 ### `migrate`
 - Everything `introduce` does
-- Maps legacy labels on issues to their taxonomy equivalents
+- Maps legacy labels on issues to their governance label equivalents
 - Preserves existing labels — does not remove anything
 - Applies to all issues and open PRs
 
-### `enforce`
+### `reconcile`
 - Everything `migrate` does
 - Deletes any label in the repository not defined in `labels.json`
 - Applies minimum policy: adds `priority: medium` to any work item with no priority label
 - Applies minimum policy: adds `type: task` to any work item with no type label
 - Minimum policy applies to all issues and open PRs; closed PRs are not modified
+- Recommended interpretation: weekly reconciliation mode for drift prevention
 
 ---
 
@@ -71,10 +72,10 @@ This repository provides a centralised platform to standardise and enforce GitHu
 
 | Input | Required | Default (scheduled) | Description |
 |---|---|---|---|
-| `mode` | Yes | `enforce` | Execution mode: `introduce`, `migrate`, or `enforce` |
+| `mode` | Yes | `reconcile` | Execution mode: `introduce`, `migrate`, or `reconcile` (drift prevention) |
 | `stage` | Yes | `all` | Rollout scope: `stage1`, `stage2`, or `all` |
 | `dry_run` | Yes | `false` | When `true`, logs all planned changes without writing anything |
-| `enforce_confirmation` | No | n/a | Enforce mode only — leave blank for introduce/migrate. Type `ENFORCE` to confirm. |
+| `reconcile_confirmation` | No | n/a | Reconcile mode only — leave blank for introduce/migrate. Type `RECONCILE` to confirm. |
 
 ---
 
@@ -85,16 +86,16 @@ This repository provides a centralised platform to standardise and enforce GitHu
 3. `migrate` + `stage1` + `dry_run=true` — preview issue remapping
 4. `migrate` + `stage1` + `dry_run=false` — apply
 5. Repeat steps 1–4 for `stage2`
-6. `enforce` + `all` + `dry_run=true` — preview full enforcement
-7. `enforce` + `all` + `dry_run=false` — apply full manual enforcement across all app-accessible repositories
+6. `reconcile` + `all` + `dry_run=true` — preview full reconciliation
+7. `reconcile` + `all` + `dry_run=false` — apply full manual reconciliation across all app-accessible repositories
 
 ---
 
-## Scheduled Enforcement
+## Scheduled Reconciliation
 
-Scheduled enforcement is active using the cron line in `.github/workflows/labels-governance.yml`.
+Scheduled reconciliation is active using the cron line in `.github/workflows/labels-governance.yml`.
 
-The workflow runs automatically every **Monday at 03:00 UTC** in `enforce` mode across all app-accessible repositories with `dry_run=false`.
+The workflow runs automatically every **Monday at 03:00 UTC** in `reconcile` mode across all app-accessible repositories with `dry_run=false`.
 
 This is independent of manual runs. Running step 7 above does not enable schedule; schedule is already active whenever cron is enabled.
 
