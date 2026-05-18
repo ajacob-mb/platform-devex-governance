@@ -68,6 +68,20 @@ This repository provides a centralised platform to standardise and reconcile Git
 
 ---
 
+## Authentication
+
+The workflow uses a GitHub App installation token for cross-repository operations.
+
+Configure these repository (or organization) Actions secrets where this workflow runs:
+
+- `GH_APP_ID`
+- `GH_APP_PRIVATE_KEY`
+- `GH_INSTALLATION_ID`
+
+`GITHUB_TOKEN` is still present for workflow runtime, but label-governance API calls use the GitHub App token generated from the secrets above.
+
+---
+
 ## Workflow Inputs
 
 | Input | Required | Default (scheduled) | Description |
