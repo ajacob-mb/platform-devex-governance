@@ -1,0 +1,10 @@
+{
+  "stage1": [
+    "ajacob-mb/MergeDocToPDF",
+    "ajacob-mb/DocGenerator"
+  ],
+  "stage2": [
+    "ajacob-mb/Project_BMT",
+    "ajacob-mb/GitHub-Issues-Demo"
+  ]
+}

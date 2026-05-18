@@ -1,0 +1,16 @@
+{
+  "bug": "type: bug",
+  "enhancement": "type: feature",
+  "feature": "type: feature",
+
+  "documentation": "type: docs",
+  "docs": "type: docs",
+
+  "duplicate": "flag: duplicate",
+  "invalid": "flag: invalid",
+  "wontfix": "flag: wontfix",
+
+  "hotfix": "type: bug",
+  "chore": "type: task",
+  "release": "type: task"
+}

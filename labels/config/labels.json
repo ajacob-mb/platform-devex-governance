@@ -1,0 +1,64 @@
+[
+  {
+    "name": "type: bug",
+    "color": "d73a4a",
+    "description": "Defect or unintended behaviour in existing functionality"
+  },
+  {
+    "name": "type: docs",
+    "color": "1d76db",
+    "description": "Documentation change"
+  },
+  {
+    "name": "type: feature",
+    "color": "0e8a16",
+    "description": "New functionality or enhancement"
+  },
+  {
+    "name": "type: task",
+    "color": "6f42c1",
+    "description": "General work item or chore"
+  },
+
+  {
+    "name": "priority: high",
+    "color": "f97316",
+    "description": "Address within current sprint"
+  },
+  {
+    "name": "priority: medium",
+    "color": "fbca04",
+    "description": "Normal priority"
+  },
+  {
+    "name": "priority: low",
+    "color": "d6a56f",
+    "description": "Low urgency"
+  },
+
+  {
+    "name": "flag: rework",
+    "color": "a7b0cf",
+    "description": "Requires rework after review"
+  },
+  {
+    "name": "flag: blocked",
+    "color": "8b949e",
+    "description": "Blocked by dependency or decision"
+  },
+  {
+    "name": "flag: duplicate",
+    "color": "59636e",
+    "description": "Issue already exists elsewhere"
+  },
+  {
+    "name": "flag: invalid",
+    "color": "59636e",
+    "description": "Not valid or cannot be reproduced"
+  },
+  {
+    "name": "flag: wontfix",
+    "color": "59636e",
+    "description": "Deliberately not actioned"
+  }
+]
