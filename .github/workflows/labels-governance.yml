@@ -67,28 +67,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Validate GitHub App configuration
-        shell: bash
-        run: |
-          if [ -z "${{ secrets.GH_APP_ID }}" ]; then
-            echo "Missing required secret: GH_APP_ID"
-            exit 1
-          fi
-
-          if [ -z "${{ secrets.GH_APP_PRIVATE_KEY }}" ]; then
-            echo "Missing required secret: GH_APP_PRIVATE_KEY"
-            exit 1
-          fi
-
-      # Use the official GitHub action to create an installation token.
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-
       - name: Reconcile mode confirmation guard
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'reconcile' }}
         shell: bash
@@ -103,7 +81,7 @@ jobs:
         id: run-governance
         uses: actions/github-script@v7
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
 
@@ -142,12 +120,39 @@ jobs:
             };
 
             const listAllAccessibleRepositories = async () => {
-              const installationRepos = await github.paginate(
-                github.rest.apps.listReposAccessibleToInstallation,
-                { per_page: 100 }
+              const owner = context.repo.owner;
+
+              // Prefer listing organization repositories when owner is an org.
+              try {
+                const orgRepos = await github.paginate(
+                  github.rest.repos.listForOrg,
+                  {
+                    org: owner,
+                    type: 'all',
+                    per_page: 100
+                  }
+                );
+
+                return orgRepos.map(repo => repo.full_name);
+              } catch (err) {
+                if (err.status !== 404) {
+                  throw err;
+                }
+              }
+
+              // Fallback for user-owned repositories.
+              const userRepos = await github.paginate(
+                github.rest.repos.listForAuthenticatedUser,
+                {
+                  visibility: 'all',
+                  affiliation: 'owner,collaborator,organization_member',
+                  per_page: 100
+                }
               );
 
-              return installationRepos.map(repo => `${repo.owner.login}/${repo.name}`);
+              return userRepos
+                .filter(repo => repo.owner?.login === owner)
+                .map(repo => repo.full_name);
             };
 
             const totals = {
@@ -208,7 +213,7 @@ jobs:
             let repos = [];
 
             if (STAGE === 'all') {
-              console.log('🌐 Resolving all repositories accessible to this GitHub App installation');
+              console.log('🌐 Resolving all repositories accessible with GITHUB_TOKEN');
               repos = [...new Set(await listAllAccessibleRepositories())]
                 .sort((a, b) => a.localeCompare(b));
             } else {
