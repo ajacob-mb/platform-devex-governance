@@ -67,14 +67,27 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ✅ GitHub App Token
+      - name: Validate GitHub App configuration
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.GH_APP_ID }}" ]; then
+            echo "Missing required secret: GH_APP_ID"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.GH_APP_PRIVATE_KEY }}" ]; then
+            echo "Missing required secret: GH_APP_PRIVATE_KEY"
+            exit 1
+          fi
+
+      # Use the official GitHub action to create an installation token.
       - name: Generate GitHub App Token
         id: app-token
-        uses: tibdex/github-app-token@v2
+        uses: actions/create-github-app-token@v1
         with:
-          app_id: ${{ secrets.GH_APP_ID }}
-          private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          installation_id: ${{ secrets.GH_INSTALLATION_ID }}
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
 
       - name: Reconcile mode confirmation guard
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'reconcile' }}
