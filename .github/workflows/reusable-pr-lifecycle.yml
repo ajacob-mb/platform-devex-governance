@@ -1,0 +1,367 @@
+name: Reusable PR Issue Lifecycle
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync-pr:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Populate issue link and sync metadata
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const action = context.payload.action || '';
+
+            if (!pr) {
+              return;
+            }
+
+            const headRef = pr.head?.ref || '';
+            const bodyIssueRegex = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|ref(?:s|erences)?|related\s+to)\s*:?[\s\n]+(?:[a-z0-9_.-]+\/[a-z0-9_.-]+)?#(\d+)/gi;
+
+            const extractIssueFromBranch = (ref) => {
+              const newFormatMatch = ref.match(/^[^\/]+\/[a-z0-9-]+-(\d+)-(?:[a-z]+-\d+|na)-/i);
+              const legacyMatch = ref.match(/-([A-Z]+-)?(\d+)(?:-(\d+))?$/);
+              const issueFromBranch = Number(
+                newFormatMatch
+                  ? newFormatMatch[1]
+                  : legacyMatch
+                    ? (legacyMatch[3] ? legacyMatch[3] : legacyMatch[2])
+                    : NaN
+              );
+              return Number.isInteger(issueFromBranch) && issueFromBranch > 0 ? issueFromBranch : null;
+            };
+
+            const issueFromBranch = extractIssueFromBranch(headRef);
+            const linkedFromBranch = issueFromBranch ? [issueFromBranch] : [];
+
+            let body = pr.body || '';
+            const placeholderRegex = /^##\s*(?:Related|Linked) Issue\s*\n\s*(?:Refs|Closes) #\[issue-number\]/mi;
+
+            if (issueFromBranch && placeholderRegex.test(body)) {
+              const updatedBody = body.replace(
+                placeholderRegex,
+                `## Linked Issue\n\nCloses #${issueFromBranch}`
+              );
+
+              if (updatedBody !== body) {
+                await github.rest.pulls.update({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  body: updatedBody,
+                });
+                body = updatedBody;
+                core.info(`Updated PR body to close issue #${issueFromBranch}`);
+              }
+            }
+
+            const linkedFromBody = [...body.matchAll(bodyIssueRegex)]
+              .map((m) => Number(m[1]))
+              .filter((n) => Number.isInteger(n) && n > 0);
+
+            const uniqueIssueNumbers = [...new Set([...linkedFromBody, ...linkedFromBranch])]
+              .filter((n) => Number.isInteger(n) && n > 0);
+
+            if (uniqueIssueNumbers.length === 0) {
+              core.info('No linked issues found from PR body keywords or branch name.');
+              return;
+            }
+
+            core.info(`Candidate linked issues: ${uniqueIssueNumbers.join(', ')}`);
+
+            const issues = [];
+            for (const issueNumber of uniqueIssueNumbers) {
+              try {
+                const issueResponse = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                });
+
+                if (issueResponse.data.pull_request) {
+                  continue;
+                }
+
+                issues.push(issueResponse.data);
+              } catch (error) {
+                core.warning(`Could not read issue #${issueNumber}: ${error.message}`);
+              }
+            }
+
+            if (issues.length === 0) {
+              core.info('No readable linked issues found.');
+              return;
+            }
+
+            const sourceIssue = issueFromBranch
+              ? issues.find((issue) => issue.number === issueFromBranch) || issues[0]
+              : issues[0];
+
+            const sourceIssueBody = sourceIssue?.body || '';
+            const jiraTokenMatch = sourceIssueBody.match(/\b(?:Implements\s+)?(JIRA-[A-Za-z]+-\d+)\b/i);
+            const jiraToken = jiraTokenMatch ? jiraTokenMatch[1].toUpperCase() : null;
+
+            const jiraPlaceholderRegex = /(##\s*Jira Subtask\s*\n\s*)Implements JIRA-\[subtask-id\]/im;
+            if (jiraToken && jiraPlaceholderRegex.test(body)) {
+              const updatedBody = body.replace(jiraPlaceholderRegex, `$1Implements ${jiraToken}`);
+              if (updatedBody !== body) {
+                await github.rest.pulls.update({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  body: updatedBody,
+                });
+                body = updatedBody;
+                core.info(`Updated Jira Subtask line to Implements ${jiraToken}`);
+              }
+            }
+
+            const acPlaceholderRegex = /<!-- auto:acceptance-criteria -->\n_Will be populated from the linked issue\._/m;
+            if (acPlaceholderRegex.test(body)) {
+              const acSectionMatch = sourceIssueBody.match(/##\s*(?:Acceptance Criteria(?:\s*\(Gherkin\))?|Verification Steps)\s*\n+([\s\S]*?)(?=\n+##\s|$)/i);
+              const acContent = acSectionMatch ? acSectionMatch[1].trim() : null;
+              if (acContent) {
+                const updatedBody = body.replace(
+                  acPlaceholderRegex,
+                  `<!-- auto:acceptance-criteria -->\n${acContent}`
+                );
+                if (updatedBody !== body) {
+                  await github.rest.pulls.update({
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    body: updatedBody,
+                  });
+                  body = updatedBody;
+                  core.info('Populated Acceptance Criteria from linked issue.');
+                }
+              }
+            }
+
+            const currentTitle = pr.title || '';
+            const sourceTitle = sourceIssue?.title || currentTitle;
+            const placeholderTitleRegex = /jira title goes here|exact jira subtask title/i;
+            const branchVersionMatch = headRef.match(/-v(\d+)$/i);
+            const branchVersionSuffix = branchVersionMatch ? ` V${branchVersionMatch[1]}` : '';
+            const shouldStandardizeTitle = jiraToken
+              && (
+                action === 'opened'
+                || placeholderTitleRegex.test(currentTitle)
+                || currentTitle.trim() === sourceTitle.trim()
+              );
+
+            if (shouldStandardizeTitle) {
+              const shortJiraToken = jiraToken.replace(/^JIRA-/i, '');
+              const titleParts = sourceTitle.match(/^\s*(\[[^\]]+\])\s*(.*)$/);
+              const titleRemainder = titleParts ? titleParts[2].trim() : sourceTitle.trim();
+              const desiredTitle = `${shortJiraToken} - ${titleRemainder}${branchVersionSuffix}`;
+              if (desiredTitle !== currentTitle) {
+                await github.rest.pulls.update({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  title: desiredTitle,
+                });
+                core.info(`Updated PR title format: ${desiredTitle}`);
+              }
+            }
+
+            const prIssue = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: pr.number,
+            });
+
+            const issueLabelSet = new Set();
+            for (const issue of issues) {
+              for (const label of issue.labels || []) {
+                const labelName = typeof label === 'string' ? label : label.name;
+                if (labelName) {
+                  issueLabelSet.add(labelName);
+                }
+              }
+            }
+
+            const existingPrLabels = (prIssue.data.labels || [])
+              .map((label) => (typeof label === 'string' ? label : label.name))
+              .filter(Boolean);
+
+            const labelsToAdd = [...issueLabelSet].filter((name) => !existingPrLabels.includes(name));
+
+            if (labelsToAdd.length > 0) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  labels: labelsToAdd,
+                });
+                core.info(`Added ${labelsToAdd.length} labels to PR #${pr.number}: ${labelsToAdd.join(', ')}`);
+              } catch (error) {
+                core.warning(`Could not add labels to PR #${pr.number}: ${error.message}`);
+              }
+            } else {
+              core.info('No new labels to add to PR.');
+            }
+
+            const firstIssueWithMilestone = issues.find((issue) => issue.milestone);
+            const sourceMilestone = firstIssueWithMilestone?.milestone || null;
+            const prMilestone = prIssue.data.milestone || null;
+
+            if (sourceMilestone && (!prMilestone || prMilestone.number !== sourceMilestone.number)) {
+              try {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  milestone: sourceMilestone.number,
+                });
+                core.info(`Set milestone ${sourceMilestone.title} on PR #${pr.number}.`);
+              } catch (error) {
+                core.warning(`Could not set milestone on PR #${pr.number}: ${error.message}`);
+              }
+            } else {
+              core.info('No milestone change needed for PR.');
+            }
+
+            const assigneeLogins = new Set();
+            for (const issue of issues) {
+              for (const assignee of issue.assignees || []) {
+                if (assignee?.login) {
+                  assigneeLogins.add(assignee.login);
+                }
+              }
+            }
+
+            if (assigneeLogins.size === 0) {
+              core.info('No assignees to sync from linked issues.');
+              return;
+            }
+
+            const currentPrAssignees = new Set(
+              (prIssue.data.assignees || []).map((assignee) => assignee.login).filter(Boolean)
+            );
+            const assigneesToAdd = [...assigneeLogins].filter((login) => !currentPrAssignees.has(login));
+
+            if (assigneesToAdd.length > 0) {
+              try {
+                await github.rest.issues.addAssignees({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  assignees: assigneesToAdd,
+                });
+                core.info(`Added assignees ${assigneesToAdd.join(', ')} to PR #${pr.number}.`);
+              } catch (error) {
+                core.warning(`Could not add assignees to PR #${pr.number}: ${error.message}`);
+              }
+            } else {
+              core.info('No new assignees to add to PR.');
+            }
+
+  reopen-if-unmerged:
+    if: github.event.action == 'closed' && github.event.pull_request.merged != true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reopen linked issues if PR closed without merge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+
+            if (!pr || pr.merged) {
+              return;
+            }
+
+            const body = pr.body || '';
+            const issueLinkRegex = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|ref(?:s|erences)?|related\s+to)\s*:?[\s\n]+(?:[a-z0-9_.-]+\/[a-z0-9_.-]+)?#(\d+)/gi;
+            const linkedFromBody = [...body.matchAll(issueLinkRegex)]
+              .map((m) => Number(m[1]))
+              .filter((n) => Number.isInteger(n) && n > 0);
+
+            const headRef = pr.head?.ref || '';
+            const newFormatMatch = headRef.match(/^[^\/]+\/[a-z0-9-]+-(\d+)-(?:[a-z]+-\d+|na)-/i);
+            const legacyMatch = headRef.match(/-([A-Z]+-)?(\d+)(?:-(\d+))?$/);
+            const issueFromBranch = Number(
+              newFormatMatch
+                ? newFormatMatch[1]
+                : legacyMatch
+                  ? (legacyMatch[3] ? legacyMatch[3] : legacyMatch[2])
+                  : NaN
+            );
+            const linkedFromBranch = Number.isInteger(issueFromBranch) && issueFromBranch > 0
+              ? [issueFromBranch]
+              : [];
+
+            const issueNumbers = [...new Set([...linkedFromBody, ...linkedFromBranch])]
+              .filter((n) => Number.isInteger(n) && n > 0);
+
+            if (issueNumbers.length === 0) {
+              core.info('No linked issues found to evaluate.');
+              return;
+            }
+
+            for (const issueNumber of issueNumbers) {
+              try {
+                const issueResponse = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                });
+
+                const issue = issueResponse.data;
+                if (issue.pull_request) {
+                  continue;
+                }
+
+                const labelNames = (issue.labels || [])
+                  .map((label) => (typeof label === 'string' ? label : label.name || ''))
+                  .map((name) => name.toLowerCase());
+                const terminalFlags = ['flag: duplicate', 'flag: invalid', 'flag: wontfix'];
+                const terminalFlag = terminalFlags.find((flag) => labelNames.includes(flag));
+
+                if (terminalFlag) {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: `Skipped automatic reopen because this issue is marked with terminal flag \`${terminalFlag}\`. Remove the flag first if work should resume.`,
+                  });
+                  core.info(`Skipped reopening issue #${issueNumber} due to terminal flag ${terminalFlag}.`);
+                  continue;
+                }
+
+                if (issue.state === 'closed') {
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    state: 'open',
+                  });
+
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: `Reopened automatically because PR #${pr.number} was closed without merge.`,
+                  });
+
+                  core.info(`Reopened issue #${issueNumber}.`);
+                }
+              } catch (error) {
+                core.warning(`Could not process issue #${issueNumber}: ${error.message}`);
+              }
+            }

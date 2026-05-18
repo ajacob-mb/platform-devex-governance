@@ -1,0 +1,499 @@
+name: Reusable Issue Flag Governance
+
+on:
+  workflow_call:
+
+permissions:
+  issues: write
+
+jobs:
+  enforce-flags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce flag governance and safeguards
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue = context.payload.issue;
+            const label = context.payload.label;
+            const action = context.payload.action; // 'labeled' or 'unlabeled'
+
+            if (!issue) {
+              return;
+            }
+
+            // Ignore PR comments/events. This workflow is issue-only.
+            if (issue.pull_request) {
+              return;
+            }
+
+            const terminalFlags = ['flag: duplicate', 'flag: invalid', 'flag: wontfix'];
+            const duplicatePattern = /^Duplicate of #(\d+)/i;
+            const reasonPattern = /^Reason:\s+(.+)/i;
+
+            const listAllComments = async (issueNumber) => {
+              return github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+            };
+
+            const listAllEvents = async (issueNumber) => {
+              return github.paginate(github.rest.issues.listEvents, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+            };
+
+            const getLatestFlagAppliedAt = async (issueNumber, flagLabel) => {
+              const events = await listAllEvents(issueNumber);
+              const matches = events
+                .filter((e) => e?.event === 'labeled' && (e?.label?.name || '').toLowerCase() === flagLabel.toLowerCase())
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              return matches.length > 0 ? new Date(matches[0].created_at) : null;
+            };
+
+            const getLatestMatchingCommentAfter = async (issueNumber, pattern, afterDate) => {
+              const comments = await listAllComments(issueNumber);
+              const matches = comments
+                .filter((c) => {
+                  const body = (c?.body || '').trim();
+                  if (!pattern.test(body)) {
+                    return false;
+                  }
+                  if (!afterDate) {
+                    return true;
+                  }
+                  const createdAt = new Date(c.created_at);
+                  return createdAt > afterDate;
+                })
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              return matches.length > 0 ? matches[0] : null;
+            };
+
+            const closeAsDuplicate = async (targetIssue, targetIssueNumber) => {
+              if (targetIssue.pull_request) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `❌ **Cannot close as duplicate**: Target #${targetIssueNumber} is a pull request, not an issue. Please update the reference.`,
+                });
+                return false;
+              }
+
+              if (targetIssueNumber === issue.number) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: '❌ **Cannot close as duplicate**: An issue cannot be marked as duplicate of itself. Please reference another issue number.',
+                });
+                return false;
+              }
+
+              const latestIssue = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              if (latestIssue.data.state === 'closed') {
+                return true;
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `**Closed as duplicate.** This issue has been superseded by #${targetIssueNumber}. For ongoing discussion, see the [original issue](#${targetIssueNumber}).`,
+              });
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+
+              return true;
+            };
+
+            const closeWithReason = async (flagName, reasonComment) => {
+              const latestIssue = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              if (latestIssue.data.state === 'closed') {
+                return true;
+              }
+
+              const reasonText = (reasonComment?.body || '').trim();
+
+              if (flagName === 'invalid') {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `**Closed as invalid.** Feedback:\n\n${reasonText}\n\nPlease address the feedback and reopen, or create a new issue with the required details.`,
+                });
+              } else if (flagName === 'wontfix') {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `**Closed as wontfix.** Decision rationale:\n\n${reasonText}\n\nIf this decision should be revisited, create a new issue with updated context.`,
+                });
+              }
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+
+              return true;
+            };
+
+            // Handle immediate terminal closure when a matching keyword comment is added after flagging.
+            if (context.eventName === 'issue_comment' && action === 'created') {
+              const comment = context.payload.comment;
+              const commentBody = (comment?.body || '').trim();
+
+              const allowedAuthors = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+              const authorAssociation = comment?.author_association || 'NONE';
+              if (!allowedAuthors.has(authorAssociation)) {
+                return;
+              }
+
+              const issueResponse = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              const freshIssue = issueResponse.data;
+
+              const labelNames = (freshIssue.labels || [])
+                .map((l) => (typeof l === 'string' ? l : l.name || ''))
+                .map((s) => s.toLowerCase());
+              const activeTerminalFlag = terminalFlags.find((f) => labelNames.includes(f));
+              const hasBlockedFlag = labelNames.includes('flag: blocked');
+              if (!activeTerminalFlag && !hasBlockedFlag) {
+                return;
+              }
+
+              if (freshIssue.state === 'closed') {
+                return;
+              }
+
+              const isDuplicateComment = duplicatePattern.test(commentBody);
+              const isReasonComment = reasonPattern.test(commentBody);
+
+              if (activeTerminalFlag === 'flag: duplicate' && !isDuplicateComment) {
+                return;
+              }
+              if ((activeTerminalFlag === 'flag: invalid' || activeTerminalFlag === 'flag: wontfix') && !isReasonComment) {
+                return;
+              }
+              if (hasBlockedFlag && !activeTerminalFlag && !isReasonComment) {
+                return;
+              }
+
+              const activeFlagLabel = activeTerminalFlag || 'flag: blocked';
+              const flagAppliedAt = await getLatestFlagAppliedAt(freshIssue.number, activeFlagLabel);
+              const commentCreatedAt = new Date(comment.created_at);
+              if (flagAppliedAt && commentCreatedAt <= flagAppliedAt) {
+                return;
+              }
+
+              try {
+                if (activeTerminalFlag === 'flag: duplicate') {
+                  const duplicateRefMatch = commentBody.match(duplicatePattern);
+                  const targetIssueNumber = duplicateRefMatch ? parseInt(duplicateRefMatch[1], 10) : NaN;
+                  if (!Number.isInteger(targetIssueNumber) || targetIssueNumber <= 0) {
+                    return;
+                  }
+
+                  const targetIssue = await github.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: targetIssueNumber,
+                  });
+
+                  const closed = await closeAsDuplicate(targetIssue.data, targetIssueNumber);
+                  if (closed) {
+                    core.info(`Closed issue #${freshIssue.number} as duplicate of #${targetIssueNumber} from comment event.`);
+                  }
+                } else if (activeTerminalFlag) {
+                  const flagName = activeTerminalFlag.replace('flag: ', '');
+                  const closed = await closeWithReason(flagName, comment);
+                  if (closed) {
+                    core.info(`Closed issue #${freshIssue.number} as ${flagName} from comment event.`);
+                  }
+                } else {
+                  // Blocked uses Reason: keyword for consistency, but does not close.
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: freshIssue.number,
+                    body: `Blocked reason recorded from latest comment: ${commentBody}`,
+                  });
+                  core.info(`Recorded blocked reason for issue #${freshIssue.number} from comment event.`);
+                }
+              } catch (error) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: freshIssue.number,
+                  body: `⚠️ **Error while processing terminal flag closure**: ${error.message}`,
+                });
+              }
+
+              return;
+            }
+
+            if (!label) {
+              return;
+            }
+
+            const flagLabels = ['flag: blocked', 'flag: duplicate', 'flag: invalid', 'flag: wontfix'];
+            const isFlagLabel = flagLabels.includes(label.name.toLowerCase());
+
+            if (!isFlagLabel) {
+              return;
+            }
+
+            // Authorization: only collaborators (OWNER, MEMBER, COLLABORATOR) can apply flags
+            const actorAssociation = context.payload.sender?.type === 'Bot' ? 'BOT' : context.payload.sender?.type || 'NONE';
+
+            // For user events, fetch their association with the repo
+            let userAssociation = 'NONE';
+            try {
+              const userRepoResponse = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: context.payload.sender?.login || 'unknown',
+              });
+              userAssociation = userRepoResponse.data.permission || 'NONE';
+            } catch (error) {
+              // If user is not found, use 'NONE'
+              userAssociation = 'NONE';
+            }
+
+            // Map permission level to association for simplicity
+            const allowedAssociations = ['admin', 'maintain', 'write'];
+            if (!allowedAssociations.includes(userAssociation) && actorAssociation !== 'BOT') {
+              // Remove the flag if non-collaborator applied it
+              const currentLabels = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name));
+              if (currentLabels.includes(label.name)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    name: label.name,
+                  });
+                } catch (error) {
+                  core.warning(`Could not remove label ${label.name}: ${error.message}`);
+                }
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `⚠️ **Authorization failed**: Only collaborators (maintainers with write access) can apply or remove flags. Flag \`${label.name}\` has been removed. Please contact a collaborator if you believe this should be applied.`,
+              });
+              core.setFailed(`Non-collaborator ${context.payload.sender?.login} attempted to apply flag ${label.name}`);
+              return;
+            }
+
+            // On unlabel event: post audit comment and stop
+            if (action === 'unlabeled') {
+              const actor = context.payload.sender?.login || 'unknown';
+              const timestamp = new Date().toISOString();
+              const removedLabel = (label.name || '').toLowerCase();
+              const terminalFlagSet = new Set(['flag: duplicate', 'flag: invalid', 'flag: wontfix']);
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `🏷️ **Flag removed**: \`${label.name}\` (by @${actor} at ${timestamp})`,
+              });
+
+              // If a terminal flag is removed from a closed issue, reopen it so work can be resumed.
+              if (terminalFlagSet.has(removedLabel) && issue.state === 'closed') {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: 'open',
+                });
+
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `Issue reopened automatically because terminal flag \`${label.name}\` was removed.`,
+                });
+              }
+
+              core.info(`Flag removed: ${label.name} on issue #${issue.number}`);
+              return;
+            }
+
+            // On labeled event: enforce one-flag-only, post audit comment, and validate safeguards
+            if (action === 'labeled') {
+              const actor = context.payload.sender?.login || 'unknown';
+              const timestamp = new Date().toISOString();
+              const flagName = label.name.replace('flag: ', '');
+
+              const currentLabels = (issue.labels || [])
+                .map((l) => (typeof l === 'string' ? l : l.name || ''))
+                .filter((name) => name !== label.name);
+
+              const otherFlagLabel = currentLabels.find((name) =>
+                flagLabels.includes(name.toLowerCase())
+              );
+
+              // Enforce one-flag-only: remove any previous flag
+              if (otherFlagLabel) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    name: otherFlagLabel,
+                  });
+                  core.info(`Removed previous flag ${otherFlagLabel}`);
+                } catch (error) {
+                  core.warning(`Could not remove previous flag ${otherFlagLabel}: ${error.message}`);
+                }
+              }
+
+              // Post audit comment
+              const transitionText = otherFlagLabel
+                ? ` (changed from \`${otherFlagLabel}\`)`
+                : '';
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `🏷️ **Flag applied**: \`${label.name}\`${transitionText} (by @${actor} at ${timestamp})`,
+              });
+
+              // For terminal flags, check safeguards
+              if (terminalFlags.includes(label.name.toLowerCase())) {
+                core.info(`Terminal flag applied: ${label.name}. Checking safeguards.`);
+
+                const flagName = label.name.replace('flag: ', '');
+                const flagAppliedAt = await getLatestFlagAppliedAt(issue.number, label.name.toLowerCase());
+
+                let safeguardMet = false;
+                let safeguardComment = null;
+
+                if (flagName === 'duplicate') {
+                  const latestDuplicateRef = await getLatestMatchingCommentAfter(issue.number, duplicatePattern, flagAppliedAt);
+                  if (latestDuplicateRef) {
+                    safeguardMet = true;
+                    safeguardComment = latestDuplicateRef;
+                  }
+                } else if (flagName === 'invalid' || flagName === 'wontfix') {
+                  const latestReason = await getLatestMatchingCommentAfter(issue.number, reasonPattern, flagAppliedAt);
+                  if (latestReason) {
+                    safeguardMet = true;
+                    safeguardComment = latestReason;
+                  }
+                }
+
+                if (!safeguardMet) {
+                  // Safeguard not met: post reminder
+                  let reminder = '';
+                  if (flagName === 'duplicate') {
+                    reminder = `This issue is flagged as **duplicate**. Before it can be closed, please add a comment referencing the original issue in the format:\n\n\`\`\`\nDuplicate of #N\n\`\`\`\n\nExample: \`Duplicate of #42\``;
+                  } else if (flagName === 'invalid') {
+                    reminder = `This issue is flagged as **invalid**. Before it can be closed, add a comment using the keyword format: \`Reason: <your rationale>\`.`;
+                  } else if (flagName === 'wontfix') {
+                    reminder = `This issue is flagged as **wontfix**. Before it can be closed, add a comment using the keyword format: \`Reason: <your rationale>\`.`;
+                  }
+
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: `⏳ **Safeguard reminder**: ${reminder}`,
+                  });
+
+                  core.info(`Terminal flag applied but safeguard not met for issue #${issue.number}`);
+                  return;
+                }
+
+                // Safeguards met: proceed with closure
+                if (flagName === 'duplicate') {
+                  // Extract the target issue number from "Duplicate of #N"
+                  const duplicateMatch = (safeguardComment.body || '').match(/Duplicate of #(\d+)/i);
+                  const targetIssueNumber = duplicateMatch ? parseInt(duplicateMatch[1], 10) : null;
+
+                  if (targetIssueNumber) {
+                    try {
+                      const targetIssue = await github.rest.issues.get({
+                        owner,
+                        repo,
+                        issue_number: targetIssueNumber,
+                      });
+
+                      const closed = await closeAsDuplicate(targetIssue.data, targetIssueNumber);
+                      if (closed) {
+                        core.info(`Closed issue #${issue.number} as duplicate of #${targetIssueNumber}`);
+                      }
+                    } catch (error) {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: issue.number,
+                        body: `⚠️ **Error verifying duplicate target**: Could not verify issue #${targetIssueNumber}. Please check the reference: ${error.message}`,
+                      });
+                    }
+                  }
+                } else if (flagName === 'invalid') {
+                  const closed = await closeWithReason(flagName, safeguardComment);
+                  if (closed) {
+                    core.info(`Closed issue #${issue.number} as invalid`);
+                  }
+                } else if (flagName === 'wontfix') {
+                  const closed = await closeWithReason(flagName, safeguardComment);
+                  if (closed) {
+                    core.info(`Closed issue #${issue.number} as wontfix`);
+                  }
+                }
+              } else if (label.name.toLowerCase() === 'flag: blocked') {
+                const flagAppliedAt = await getLatestFlagAppliedAt(issue.number, 'flag: blocked');
+                const latestReason = await getLatestMatchingCommentAfter(issue.number, reasonPattern, flagAppliedAt);
+
+                if (!latestReason) {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: '🚧 **Issue is blocked.** Add a reason comment using keyword format: `Reason: <blocking dependency or decision>`.',
+                  });
+                  core.info(`Blocked flag applied without Reason: comment on issue #${issue.number}`);
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: `Blocked reason confirmed from latest matching comment: ${latestReason.body}`,
+                  });
+                  core.info(`Blocked reason confirmed for issue #${issue.number}`);
+                }
+              }
+            }

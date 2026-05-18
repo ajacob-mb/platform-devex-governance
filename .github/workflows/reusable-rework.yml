@@ -1,0 +1,113 @@
+name: Reusable Issue Rework Command
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  rework:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /rework command
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueFromEvent = context.payload.issue;
+            const comment = context.payload.comment;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            if (!issueFromEvent) {
+              return;
+            }
+
+            // Ignore PR comments. We only support issue comments.
+            if (issueFromEvent.pull_request) {
+              return;
+            }
+
+            const command = (comment?.body || '').trim();
+            if (!/^\/rework\b/i.test(command)) {
+              return;
+            }
+
+            // Only collaborators can invoke rework
+            const allowedAuthors = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const authorAssociation = comment?.author_association || 'NONE';
+            if (!allowedAuthors.has(authorAssociation)) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueFromEvent.number,
+                body: 'Only repository collaborators can invoke `/rework`.',
+              });
+              return;
+            }
+
+            // Block rework when terminal governance flags are present.
+            const terminalFlags = ['flag: blocked', 'flag: duplicate', 'flag: invalid', 'flag: wontfix'];
+            const hasTerminalFlag = (issueFromEvent.labels || []).some((label) => {
+              const labelName = typeof label === 'string' ? label : label?.name;
+              return terminalFlags.includes(labelName);
+            });
+
+            if (hasTerminalFlag) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueFromEvent.number,
+                body: 'Cannot run `/rework`: this issue has a terminal governance flag (`flag: blocked`, `flag: duplicate`, `flag: invalid`, or `flag: wontfix`). Remove the flag first, then re-run `/rework`.',
+              });
+              return;
+            }
+
+            // Extract reason from command (format: /rework Reason text here)
+            const reasonMatch = command.match(/^\/rework\s+(.+)$/i);
+            const reason = reasonMatch ? reasonMatch[1].trim() : 'Rework required - awaiting BA decision';
+
+            const repoResponse = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoResponse.data.default_branch;
+
+            // Reopen issue if closed
+            if (issueFromEvent.state === 'closed') {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issueFromEvent.number,
+                state: 'open',
+              });
+              core.info(`Reopened issue #${issueFromEvent.number}`);
+            }
+
+            // Apply rework flag with reason
+            try {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueFromEvent.number,
+                labels: ['flag: rework'],
+              });
+              core.info(`Applied flag: rework to issue #${issueFromEvent.number}`);
+            } catch (error) {
+              core.warning(`Could not add rework flag: ${error.message}`);
+            }
+
+            // Post rework status comment
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueFromEvent.number,
+              body: [
+                '🔄 **Rework triggered**',
+                '',
+                `**Reason:** ${reason}`,
+                '',
+                'Next steps:',
+                '1. Comment `/create-branch` to create the next iteration branch (will append `-v2`, `-v3`, etc.)',
+                `2. Push commits and open a new PR targeting \`${defaultBranch}\``,
+                '3. PR will auto-close this issue on merge once BA approves',
+              ].join('\n'),
+            });

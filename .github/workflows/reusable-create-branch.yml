@@ -1,0 +1,230 @@
+name: Reusable Create Issue Branch
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create branch and comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueFromEvent = context.payload.issue;
+            const comment = context.payload.comment;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            if (!issueFromEvent) {
+              return;
+            }
+
+            // Ignore PR comments. We only support issue comments.
+            if (issueFromEvent.pull_request) {
+              return;
+            }
+
+            const command = (comment?.body || '').trim();
+            if (!/^\/create-branch\b/i.test(command)) {
+              return;
+            }
+
+            const allowedAuthors = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const authorAssociation = comment?.author_association || 'NONE';
+            if (!allowedAuthors.has(authorAssociation)) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueFromEvent.number,
+                body: 'Only repository collaborators can run `/create-branch`.',
+              });
+              return;
+            }
+
+            const issueResponse = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueFromEvent.number,
+            });
+            const issue = issueResponse.data;
+
+            const assignees = (issue.assignees || []).filter((a) => a?.login);
+            if (assignees.length === 0) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: 'Cannot run `/create-branch` yet: this issue has no assignee. Please assign an owner first, then rerun `/create-branch`.',
+              });
+              core.setFailed('Issue must have at least one assignee before /create-branch can run.');
+              return;
+            }
+
+            const labelNames = (issue.labels || [])
+              .map((l) => (typeof l === 'string' ? l : l.name || ''))
+              .map((s) => s.toLowerCase());
+
+            const hasLabel = (name) => labelNames.includes(name.toLowerCase());
+
+            // Check for flag: blocked
+            if (hasLabel('flag: blocked')) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: 'Cannot run `/create-branch`: this issue is flagged as **blocked**. Progress cannot continue because it is waiting on an external dependency or decision. Remove the `flag: blocked` label when the blocker is resolved, then rerun `/create-branch`.',
+              });
+              core.setFailed('Issue is flagged as blocked. Branch creation blocked until flag is removed.');
+              return;
+            }
+
+            // Check for terminal flags (duplicate, invalid, wontfix)
+            const terminalFlags = ['flag: duplicate', 'flag: invalid', 'flag: wontfix'];
+            const appliedTerminalFlag = terminalFlags.find((f) => hasLabel(f));
+            if (appliedTerminalFlag) {
+              const flagName = appliedTerminalFlag.replace('flag: ', '');
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `Cannot run \`/create-branch\`: this issue is flagged as **${flagName}**. The issue has been closed because it is ${flagName}. If this decision should be reconsidered, a maintainer must remove the \`${appliedTerminalFlag}\` label first.`,
+              });
+              core.setFailed(`Issue is flagged as ${flagName}. Branch creation blocked.`);
+              return;
+            }
+
+            let type = 'task';
+            if (hasLabel('type: bug')) type = 'bug';
+            else if (hasLabel('type: feature')) type = 'feature';
+            else if (hasLabel('type: docs')) type = 'docs';
+            else if (hasLabel('type: task')) type = 'task';
+
+            const body = issue.body || '';
+            // Matches: Implements JIRA-DST-142, JIRA-DST-142, DST-142, N/A variants.
+            const jiraMatch = body.match(/(?:implements\s+)?(?:jira-)?([a-z]+-\d+|n\/?a|na)/i);
+            let jiraKey = jiraMatch ? jiraMatch[1].toLowerCase() : 'na';
+            jiraKey = jiraKey.replace('/', '');
+
+            const rawTitle = (issue.title || '')
+              .replace(/^\[[^\]]+\]\s*/i, '')
+              .trim()
+              .toLowerCase();
+
+            const slug = rawTitle
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-+|-+$/g, '')
+              .replace(/-{2,}/g, '-')
+              .slice(0, 48) || 'issue';
+
+            const assigneeLogin = (assignees[0]?.login || 'unassigned')
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-+|-+$/g, '');
+
+            const baseBranchData = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = baseBranchData.data.default_branch;
+
+            const baseRef = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${defaultBranch}`,
+            });
+
+            const issueNumber = issue.number;
+            const baseBranchName = `${type}/${assigneeLogin}-${issueNumber}-${jiraKey}-${slug}`;
+
+            // Check if this is a rework iteration by detecting flag: rework
+            const isRework = hasLabel('flag: rework');
+            let finalBranchName = baseBranchName;
+
+            if (isRework) {
+              // Find all existing branches for this issue to determine next version
+              const allBranches = await github.paginate(github.rest.repos.listBranches, {
+                owner,
+                repo,
+                per_page: 100,
+              });
+
+              const matchingBranches = allBranches
+                .map(b => b.name)
+                .filter(name => name.startsWith(baseBranchName));
+
+              // Determine next version suffix
+              let nextVersion = 2; // v1 is the base branch (no suffix)
+              for (const branch of matchingBranches) {
+                const versionMatch = branch.match(/-v(\d+)$/);
+                if (versionMatch) {
+                  const version = parseInt(versionMatch[1], 10);
+                  if (version >= nextVersion) {
+                    nextVersion = version + 1;
+                  }
+                }
+              }
+
+              finalBranchName = `${baseBranchName}-v${nextVersion}`;
+              core.info(`Rework iteration detected: creating branch ${finalBranchName}`);
+            }
+
+            const branchExists = async (branchName) => {
+              try {
+                await github.rest.git.getRef({ owner, repo, ref: `heads/${branchName}` });
+                return true;
+              } catch (error) {
+                if (error.status === 404) return false;
+                throw error;
+              }
+            };
+
+            const branchName = finalBranchName;
+            let createdBranch = false;
+            if (await branchExists(branchName)) {
+              core.info(`Branch already exists: ${branchName}`);
+            } else {
+              await github.graphql(
+                `
+                  mutation ($input: CreateLinkedBranchInput!) {
+                    createLinkedBranch(input: $input) {
+                      linkedBranch {
+                        ref {
+                          name
+                        }
+                      }
+                    }
+                  }
+                `,
+                {
+                  input: {
+                    issueId: issue.node_id,
+                    repositoryId: baseBranchData.data.node_id,
+                    oid: baseRef.data.object.sha,
+                    name: branchName,
+                  },
+                }
+              );
+              createdBranch = true;
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                createdBranch ? 'Branch created and linked for this issue:' : 'Branch already exists for this issue:',
+                '',
+                `- Branch: \`${branchName}\``,
+                `- Based on: \`${defaultBranch}\``,
+                '',
+                'To check it out locally:',
+                `\`git fetch origin; git checkout ${branchName}\``,
+                '',
+                'Next steps:',
+                `1. Push commits to \`${branchName}\`.`,
+                `2. Open a PR from \`${branchName}\` into \`${defaultBranch}\`.`,
+                '3. PR lifecycle automation will populate links and sync metadata on PR events.',
+              ].join('\n'),
+            });

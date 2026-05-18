@@ -21,6 +21,78 @@ This repository provides a centralised platform to standardise and reconcile Git
 | `labels/config/label-mapping.json` | Maps legacy label names to their governance label equivalents |
 | `labels/config/staged-migration.json` | Defines `stage1` and `stage2` explicit repo lists for controlled rollout |
 | `.github/workflows/labels-governance.yml` | Main workflow — introduce, migrate, and reconcile |
+| `.github/workflows/reusable-create-branch.yml` | Reusable workflow — creates and links issue branches from `/create-branch` |
+| `.github/workflows/reusable-flag-governance.yml` | Reusable workflow — enforces issue flag policy and safeguards |
+| `.github/workflows/reusable-pr-lifecycle.yml` | Reusable workflow — syncs PR metadata with linked issues |
+| `.github/workflows/reusable-rework.yml` | Reusable workflow — handles `/rework` issue commands |
+
+---
+
+## DevEx Workflow Split
+
+This repository now separates the real-time DevEx automation into reusable workflows that are called from each target repository.
+
+Central control repository:
+
+```text
+.github/workflows/
+	labels-governance.yml
+	reusable-create-branch.yml
+	reusable-flag-governance.yml
+	reusable-pr-lifecycle.yml
+	reusable-rework.yml
+```
+
+Target repository:
+
+```text
+.github/workflows/
+	devex.yml
+```
+
+The target repository owns the event triggers. The reusable workflows in this repository own the logic and run against the caller repository context.
+
+Example target-repo caller:
+
+```yaml
+name: DevEx
+
+on:
+	issue_comment:
+		types: [created]
+	issues:
+		types: [labeled, unlabeled]
+	pull_request_target:
+		types: [opened, edited, reopened, synchronize, closed]
+
+permissions:
+	contents: write
+	issues: write
+	pull-requests: write
+
+jobs:
+	create-branch:
+		if: github.event_name == 'issue_comment'
+		uses: org-or-owner/PlatformDevExGovernance/.github/workflows/reusable-create-branch.yml@main
+
+	flag-governance:
+		if: github.event_name == 'issues' || github.event_name == 'issue_comment'
+		uses: org-or-owner/PlatformDevExGovernance/.github/workflows/reusable-flag-governance.yml@main
+
+	pr-lifecycle:
+		if: github.event_name == 'pull_request_target'
+		uses: org-or-owner/PlatformDevExGovernance/.github/workflows/reusable-pr-lifecycle.yml@main
+
+	rework:
+		if: github.event_name == 'issue_comment'
+		uses: org-or-owner/PlatformDevExGovernance/.github/workflows/reusable-rework.yml@main
+```
+
+Notes:
+
+- The caller repository must grant the permissions needed by the reusable workflow jobs.
+- `issue_comment` is intentionally shared by the create-branch, flag-governance, and rework flows; each reusable workflow filters its own commands and conditions.
+- Replace `org-or-owner/PlatformDevExGovernance@main` with the correct repository and ref before templating target repositories.
 
 ---
 
@@ -113,8 +185,8 @@ The workflow runs automatically every **Monday at 03:00 UTC** in `reconcile` mod
 
 This is independent of manual runs. Running step 7 above does not enable schedule; schedule is already active whenever cron is enabled.
 
-To pause the schedule, comment out the cron line in the workflow file and merge to the default branch.  
-To stop a run in progress, cancel it from the GitHub Actions UI.  
+To pause the schedule, comment out the cron line in the workflow file and merge to the default branch.
+To stop a run in progress, cancel it from the GitHub Actions UI.
 To disable entirely, use the workflow disable toggle in the Actions tab.
 
 ---
