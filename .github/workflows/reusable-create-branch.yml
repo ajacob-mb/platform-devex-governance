@@ -52,6 +52,40 @@ jobs:
               issue_number: issueFromEvent.number,
             });
             const issue = issueResponse.data;
+            let issueBody = issue.body || '';
+
+            const VERSION_MARKER_REGEX = /<!--\s*devex:branch-version\s*=\s*(\d+)\s*-->/i;
+            const parseTrackedVersion = (bodyText) => {
+              const markerMatch = (bodyText || '').match(VERSION_MARKER_REGEX);
+              const markerVersion = markerMatch ? Number(markerMatch[1]) : NaN;
+              return Number.isInteger(markerVersion) && markerVersion >= 1 ? markerVersion : null;
+            };
+
+            const upsertTrackedVersion = async (version) => {
+              if (!Number.isInteger(version) || version < 1) {
+                return;
+              }
+
+              const marker = `<!-- devex:branch-version=${version} -->`;
+              const existingBody = issueBody || '';
+              const trimmedBody = existingBody.trimEnd();
+              const nextBody = VERSION_MARKER_REGEX.test(existingBody)
+                ? existingBody.replace(VERSION_MARKER_REGEX, marker)
+                : `${trimmedBody}${trimmedBody ? '\n\n' : ''}${marker}`;
+
+              if (nextBody === existingBody) {
+                return;
+              }
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: nextBody,
+              });
+              issueBody = nextBody;
+              core.info(`Tracked branch version updated to ${version} on issue #${issue.number}`);
+            };
 
             const assignees = (issue.assignees || []).filter((a) => a?.login);
             if (assignees.length === 0) {
@@ -104,7 +138,7 @@ jobs:
             else if (hasLabel('type: docs')) type = 'docs';
             else if (hasLabel('type: task')) type = 'task';
 
-            const body = issue.body || '';
+            const body = issueBody;
             // Matches: Implements JIRA-DST-142, JIRA-DST-142, DST-142, N/A variants.
             const jiraMatch = body.match(/(?:implements\s+)?(?:jira-)?([a-z]+-\d+|n\/?a|na)/i);
             let jiraKey = jiraMatch ? jiraMatch[1].toLowerCase() : 'na';
@@ -141,9 +175,11 @@ jobs:
             // Check if this is a rework iteration by detecting flag: rework
             const isRework = hasLabel('flag: rework');
             let finalBranchName = baseBranchName;
+            const trackedVersion = parseTrackedVersion(issueBody);
+            let highestKnownVersion = trackedVersion || 0;
 
             if (isRework) {
-              // Find all existing branches for this issue to determine next version
+              // Find all existing branches for this issue to determine next version.
               const allBranches = await github.paginate(github.rest.repos.listBranches, {
                 owner,
                 repo,
@@ -154,18 +190,29 @@ jobs:
                 .map(b => b.name)
                 .filter(name => name.startsWith(baseBranchName));
 
-              // Determine next version suffix
-              let nextVersion = 2; // v1 is the base branch (no suffix)
+              // Derive the highest known version from existing branches.
+              let highestExistingVersion = 0;
               for (const branch of matchingBranches) {
-                const versionMatch = branch.match(/-v(\d+)$/);
-                if (versionMatch) {
-                  const version = parseInt(versionMatch[1], 10);
-                  if (version >= nextVersion) {
-                    nextVersion = version + 1;
-                  }
+                if (branch === baseBranchName) {
+                  highestExistingVersion = Math.max(highestExistingVersion, 1);
+                  continue;
+                }
+
+                const versionMatch = branch.match(/-v(\d+)$/i);
+                if (!versionMatch) {
+                  continue;
+                }
+
+                const version = parseInt(versionMatch[1], 10);
+                if (Number.isInteger(version) && version > highestExistingVersion) {
+                  highestExistingVersion = version;
                 }
               }
 
+              highestKnownVersion = Math.max(highestKnownVersion, highestExistingVersion);
+
+              // v1 is the base branch (no suffix), so rework starts at v2.
+              const nextVersion = Math.max(2, highestKnownVersion + 1);
               finalBranchName = `${baseBranchName}-v${nextVersion}`;
               core.info(`Rework iteration detected: creating branch ${finalBranchName}`);
             }
@@ -207,6 +254,21 @@ jobs:
                 }
               );
               createdBranch = true;
+            }
+
+            const createdVersionMatch = branchName.match(/-v(\d+)$/i);
+            const createdVersion = createdVersionMatch
+              ? parseInt(createdVersionMatch[1], 10)
+              : branchName === baseBranchName
+                ? 1
+                : 0;
+
+            if (Number.isInteger(createdVersion) && createdVersion > highestKnownVersion) {
+              highestKnownVersion = createdVersion;
+            }
+
+            if (createdBranch || trackedVersion === null || highestKnownVersion > (trackedVersion || 0)) {
+              await upsertTrackedVersion(Math.max(1, highestKnownVersion));
             }
 
             await github.rest.issues.createComment({
